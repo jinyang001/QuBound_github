@@ -1,0 +1,302 @@
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from numpy import linalg as la
+import scipy.stats
+import seaborn as sns
+from statsmodels.stats.correlation_tools import cov_nearest, corr_nearest
+import copy
+import math
+import pickle
+from datetime import datetime
+import warnings
+import time
+
+
+#### Supporting routines ####
+def get_marginal_dicts(colnames_time0, colnames_time1, means_std_vals_time0, means_std_vals_time1):
+    # we assume normal
+    marginals_summary_time0 = {}
+    k = 0
+    for colname in colnames_time0:
+        marginals_summary_time0[colname] = {}
+        marginals_summary_time0[colname]['means_std_vals'] = means_std_vals_time0[k];
+        k = k + 1
+        marginals_summary_time0[colname]['type'] = 'normal'
+        marginals_summary_time0[colname]['mu'] = marginals_summary_time0[colname]['means_std_vals'][0]
+        marginals_summary_time0[colname]['sigma'] = marginals_summary_time0[colname]['means_std_vals'][1]
+
+    marginals_summary_time1 = {}
+    k = 0
+    for colname in colnames_time1:
+        marginals_summary_time1[colname] = {}
+        marginals_summary_time1[colname]['means_std_vals'] = means_std_vals_time1[k];
+        k = k + 1
+        marginals_summary_time1[colname]['type'] = 'normal'
+        marginals_summary_time1[colname]['mu'] = marginals_summary_time1[colname]['means_std_vals'][0]
+        marginals_summary_time1[colname]['sigma'] = marginals_summary_time1[colname]['means_std_vals'][1]
+
+    return marginals_summary_time0, marginals_summary_time1
+
+
+def get_bhattacharya_coefficient_normalized(marginals_summary_time0, marginals_summary_time1, num_mcmc_samples):
+    BC_normalized_marginal = []
+    for (key0, value0), (key1, value1) in zip(marginals_summary_time0.items(), marginals_summary_time1.items()):
+        copula_data_time0 = generate_copula_data({key0: value0}, num_mcmc_samples, correlationMatrix=np.array([1]))
+        copula_data_time1 = generate_copula_data({key1: value1}, num_mcmc_samples, correlationMatrix=np.array([1]))
+
+        # if any negative values are generated (because of using normal), replace with mean val
+        copula_data_time0_sanitized = sanitize_copula_data(marginals_summary_time0, copula_data_time0)
+        # copula_data_time1_sanitized = sanitize_copula_data(marginals_summary_time1, copula_data_time1)
+
+        _, BC_normalized = get_hellinger_using_mcmc(g_params={key1: value1},
+                                                    f_params={key0: value0},
+                                                    f_samples=copula_data_time0_sanitized)
+
+        BC_normalized_marginal.append(BC_normalized)
+
+    return BC_normalized_marginal
+
+
+def get_smax(BC_normalized_marginal, default='average', c=1):
+    H_marginal = np.sqrt(1 - np.array(BC_normalized_marginal) ** d)
+    H_marginal_average = np.mean(H_marginal)
+
+    H_marginal_normalized = np.sqrt(1 - np.array(BC_normalized_marginal))
+    hellinger_joint_normalized = np.sqrt(1 - np.prod(1 - H_marginal_normalized ** 2))
+
+    if default == 'average':
+        smax = 2 * c * H_marginal_average * np.sqrt(2 - H_marginal_average ** 2)  # uses the average hellinger
+    else:
+        smax = 2 * c * np.sqrt(
+            1 - (1 - hellinger_joint_normalized ** 2) ** (2 * d))  # uses the dimension normalized hellinger
+
+    return smax
+
+
+def get_hellinger_normal(mu0, mu1, sigma0, sigma1, d=1):
+    # mu0    = means_std_vals_time0[5][0];
+    # mu1    = means_std_vals_time1[5][0];
+    # sigma0 = means_std_vals_time0[5][1];
+    # sigma1 = means_std_vals_time1[5][1];
+
+    coeff_term = np.sqrt(2 * sigma0 * sigma1 / (sigma0 ** 2 + sigma1 ** 2))
+    exp_term = np.exp(-0.25 * (mu0 - mu1) ** 2 / (sigma0 ** 2 + sigma1 ** 2))
+    BC = (coeff_term * exp_term)
+    return np.sqrt(1 - BC), BC ** (1 / d)
+
+
+def sanitize_copula_data(marginals, copula_data):
+    for colname in copula_data.keys():
+        # print(copula_data[colname])
+        copula_data[copula_data[colname] < 0] = marginals[colname]['mu']
+
+    return copula_data
+
+
+def generate_copula_data(marginals, num_mcmc_samples, correlationMatrix):
+    # first_key, first_value = next(iter(marginals_summary_time0.items()))
+    # marginals = {first_key:first_value }
+    # num_mcmc_samples = num_mcmc_samples
+    # correlationMatrix = np.array([1])
+
+    # correlationMatrix_monthly = cov_nearest(correlationMatrix_monthly_sampleEstimate, threshold=1e-5)
+    colnames = [item for item in marginals.keys()]
+    mcmc_samples = pd.DataFrame(columns=colnames)
+    mvnorm = scipy.stats.multivariate_normal(mean=np.zeros(len(marginals.keys())),
+                                             cov=correlationMatrix)
+    x = mvnorm.rvs(num_mcmc_samples)
+    x_unif = scipy.stats.norm.cdf(x)  # this must stay the same always
+
+    k = 0
+    for colname in colnames:  # marginals.keys():
+        # print(colname)
+        if marginals[colname]['type'] == 'normal':
+            m = scipy.stats.norm(loc=marginals[colname]['mu'],
+                                 scale=marginals[colname]['sigma'])
+            if len(colnames) > 1:
+                mcmc_samples[colname] = m.ppf(x_unif[:, k])
+            else:
+                mcmc_samples[colname] = m.ppf(x_unif)
+
+        k = k + 1
+
+    return mcmc_samples
+
+
+def get_hellinger_using_mcmc(g_params, f_params, f_samples):
+    # THESE MUST BE EVALUATED AT SAME SAMPLES!!!
+    # g_params=f_params
+    log_copula_pdf_of_f_at_fsamples = get_log_copula(f_params, f_samples)
+    log_copula_pdf_of_g_at_fsamples = get_log_copula(g_params, f_samples)
+
+    copula_pdf_of_f_at_fsamples = np.exp(log_copula_pdf_of_f_at_fsamples)
+    copula_pdf_of_g_at_fsamples = np.exp(log_copula_pdf_of_g_at_fsamples)
+
+    ind = copula_pdf_of_f_at_fsamples > 1e-8
+    ratio = np.sqrt(copula_pdf_of_g_at_fsamples[ind] / copula_pdf_of_f_at_fsamples[ind])
+
+    # ratio = np.sqrt(copula_pdf_of_g_at_fsamples / copula_pdf_of_f_at_fsamples) #beware of precision issues from crazy small numbers
+
+    BC = ratio.mean()
+    # BC
+    hellinger = np.sqrt(1 - BC)
+    return hellinger, BC ** (1 / d)
+
+
+def get_log_copula(g_params, f_samples, correlationMatrix=np.array([1])):
+    # g_params=f_params; f_samples=sample1
+    f_colnames = np.array([item for item in f_samples.keys()])
+    g_colnames = np.array([item for item in g_params.keys()])
+
+    F = {}
+    logf = {}
+    k = -1
+    for colname in g_params.keys():
+        k = k + 1
+        fcolname = f_colnames[k]
+        gcolname = g_colnames[k]
+        data = f_samples[fcolname]
+
+        if g_params[gcolname]['type'] == 'normal':
+            F[gcolname] = scipy.stats.norm.cdf(data,
+                                               g_params[gcolname]['mu'],
+                                               g_params[gcolname]['sigma'])
+
+            logf[gcolname] = scipy.stats.norm.logpdf(data,
+                                                     g_params[gcolname]['mu'],
+                                                     g_params[gcolname]['sigma'])
+
+    logf_df = pd.DataFrame.from_dict(logf)
+    F_df = pd.DataFrame.from_dict(F)
+
+    rv = scipy.stats.multivariate_normal(mean=np.zeros(len(g_colnames)),
+                                         cov=correlationMatrix)
+
+    log_copula_pdf = rv.logpdf(F_df) + np.sum(logf_df, axis=1)
+
+    return log_copula_pdf
+
+
+#################
+
+#### Initial raw data (BEWARE: SOME OF THIS IS HARD CODED) ####
+
+start_time = time.time()
+num_noise_factors = 2  # because there are two factors: T1 and T2
+num_mcmc_samples = 16000  # this number is chosen so that the answer of monte carlo integration converges
+
+colnames_time0 = [
+    "T1_q0_3pm",
+    "T1_q1_3pm",
+    "T1_q2_3pm",
+    "T1_q3_3pm",
+    "T2_q0_3pm",
+    "T2_q1_3pm",
+    "T2_q2_3pm",
+    "T2_q3_3pm",
+]
+
+means_std_vals_time0 = np.array([
+    [115.68321186672864, 1.591650559280998],
+    [133.03775258644987
+        , 1.9265356400415727
+     ],
+    [88.94491586345774
+        , 1.1232956083824572
+     ],
+    [100.90059745761329
+        , 1.3251432094825106
+     ],
+
+    [54.08831902365048
+        , 2.164772875
+     ],
+    [21.136600488130874
+        , 0.7499240354706954
+     ],
+    [42.018312209627986
+        , 1.5746610024840662
+     ],
+    [20.87559824098902
+        , 0.7417561274746862
+     ]
+])  # data is ordered as ["T1_q0_time1", "T1_q1_time1", "T1_q2_time1", "T2_q0_time1", "T2_q1_time1", "T2_q2_time1",]
+
+# colnames_time1 = [
+# "T1_q0_9pm",
+# "T1_q1_9pm",
+# "T1_q2_9pm",
+# "T1_q3_9pm",
+# "T2_q0_9pm",
+# "T2_q1_9pm",
+# "T2_q2_9pm",
+# "T2_q3_9pm",]
+
+# means_std_vals_time1 = np.array([
+# [106.280123, 1.420037],
+# [143.876804, 2.146976],
+# [68.653127,  0.812281],
+# [115.733639,  1.592590],
+
+# [83.017278,  3.834480],
+# [41.115810,  1.533448],
+# [14.342926,  0.568236],
+# [14.796376,  0.577743],
+# ])
+
+colnames_time1 = [
+    "T1_q0_0pm",
+    "T1_q1_0pm",
+    "T1_q2_0pm",
+    "T1_q3_0pm",
+    "T2_q0_0pm",
+    "T2_q1_0pm",
+    "T2_q2_0pm",
+    "T2_q3_0pm",
+]
+
+means_std_vals_time1 = np.array([
+    [110.719469, 1.500164],
+    [144.817225, 2.166494],
+    [67.519324, 0.796213],
+    [111.414208, 1.512850],
+
+    [74.005176, 3.279114],
+    [81.110451, 3.714480],
+    [15.993916, 0.605147],
+    [21.529841, 0.762367],
+])
+
+num_qubits = int(len(colnames_time0) / num_noise_factors)
+d = int(num_qubits * num_noise_factors)  # dimensionality of the joint distribution (6 for our example)
+
+#### Data structure for monte carlo based hellinger intergation ####
+marginals_summary_time0, marginals_summary_time1 = get_marginal_dicts(colnames_time0,
+                                                                      colnames_time1,
+                                                                      means_std_vals_time0,
+                                                                      means_std_vals_time1)
+
+#### bhattacharya_coefficient (Core monte carlo intergration) ####
+BC_normalized_marginal = get_bhattacharya_coefficient_normalized(marginals_summary_time0,
+                                                                 marginals_summary_time1,
+                                                                 num_mcmc_samples)
+
+#### Bound on stability ####
+smax = get_smax(BC_normalized_marginal, default='average', c=1)
+# print(get_smax(BC_normalized_marginal, default = 'weighted'))
+endtime = time.time()
+exec_time = endtime - start_time
+expectation_value_range = 2 * smax
+
+previous_day = 0.84699998  # 9/12 GHZ4
+# previous_day=0.03800001 #9/12 GHZ3
+# previous_day = 0.73799999  # 9/12 RB3
+# previous_day = 0.20200001  # 9/12 HS4
+# previous_day = 0.44199998  # 9/12 VQE4
+# previous_day = -0.18400001  # 9/12 QAOA4
+
+print("upper bound:", previous_day + smax)
+print("lower bound:", previous_day - smax)
+print("Range of Expectation Values:", expectation_value_range)
+print("Total Execution Time:", exec_time, "seconds")
