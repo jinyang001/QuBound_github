@@ -9,8 +9,8 @@ cd QuBound_github
 pip install -r requirements.txt
 
 ## Setup Instructions for running circuits on the IBM quantum platform.
-login in the IBM website: https://quantum.ibm.com/
+login on the IBM website: https://quantum.ibm.com/
 copy your API token
-go to the save_account.py file in this repo
+go to the save_account.py file within this repo
 replace the placeholder with the token
 run this py file
