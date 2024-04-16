@@ -2,8 +2,8 @@
 
 ## Setup Instructions
 
-Clone the repository:
 ```bash
+## Setup Instructions for using the framework QuBound.
 git clone https://github.com/jinyang001/QuBound_github.git
 cd QuBound_github
 pip install -r requirements.txt
